@@ -1,0 +1,17 @@
+# Google service account credentials
+*.json
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# Output data
+output/
+*.csv
