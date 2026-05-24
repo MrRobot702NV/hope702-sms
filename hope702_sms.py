@@ -110,8 +110,12 @@ def load_resources_from_sheet() -> list[Resource]:
     try:
         creds_json = os.getenv("GOOGLE_CREDS_JSON")
         if creds_json:
-            creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
-            log.info("Loaded Google credentials from GOOGLE_CREDS_JSON env var")
+            try:
+                creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
+                log.info("Loaded Google credentials from GOOGLE_CREDS_JSON env var")
+            except Exception as creds_err:
+                log.error("Failed to load credentials from GOOGLE_CREDS_JSON: %s", creds_err, exc_info=True)
+                raise
         else:
             creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
             log.info("Loaded Google credentials from file: %s", CREDS_FILE)
