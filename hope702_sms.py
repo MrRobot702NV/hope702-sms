@@ -113,8 +113,8 @@ def load_resources_from_sheet() -> list[Resource]:
         log.info("ENV KEYS with GOOGLE: %s", [k for k in os.environ if "GOOGLE" in k])
         if creds_json:
             try:
-                creds_json_fixed = creds_json.replace('\\\\n', '\\n')
-                creds = Credentials.from_service_account_info(json.loads(creds_json_fixed), scopes=SCOPES)
+                creds_json_fixed = creds_json.replace('\\\\n', '\\n').replace('\\r', '').replace('\\r\\n', '\\n')
+                creds = Credentials.from_service_account_info(json.loads(creds_json_fixed, strict=False), scopes=SCOPES)
                 log.info("Loaded Google credentials from GOOGLE_CREDS_JSON env var")
             except Exception as creds_err:
                 log.error("Failed to load credentials from GOOGLE_CREDS_JSON: %s", creds_err, exc_info=True)
