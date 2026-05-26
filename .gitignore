@@ -1,5 +1,6 @@
-# Google service account credentials
-*.json
+# Google service account credentials (never commit these)
+eng-lightning-496121-k0-486b539c0d3e.json
+creds.json
 
 # Logs
 *.log

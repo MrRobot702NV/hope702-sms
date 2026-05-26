@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SHEET_NAME       = os.getenv("HOPE702_SHEET_NAME", "HOPE 702 Resource Database")
-CREDS_FILE       = os.getenv("HOPE702_CREDS_FILE", str(Path(__file__).parent / "eng-lightning-496121-k0-486b539c0d3e.json"))
+CREDS_FILE       = os.getenv("HOPE702_CREDS_FILE", str(Path(__file__).parent / "creds.json"))
 ZIP_LOG_FILE     = Path(__file__).parent / "hope702_zip_log.csv"
 SCOPES           = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive.readonly"]
 PAGE_SIZE        = 3
