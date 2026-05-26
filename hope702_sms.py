@@ -160,7 +160,7 @@ def load_resources_from_sheet() -> list[Resource]:
         return []
 
 
-RESOURCES: list[Resource] = load_resources_from_sheet()
+RESOURCES: list[Resource] = []
 
 # ── Category metadata ─────────────────────────────────────────────────────────
 
@@ -333,6 +333,13 @@ def _log_zip(from_number: str, zip_code: str) -> None:
 # ── Flask app ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
+
+
+@app.before_request
+def _ensure_resources():
+    global RESOURCES
+    if not RESOURCES:
+        RESOURCES = load_resources_from_sheet()
 
 
 @app.route("/sms", methods=["POST"])
