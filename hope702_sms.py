@@ -109,6 +109,8 @@ def _cleanup_sessions() -> None:
 def load_resources_from_sheet() -> list[Resource]:
     try:
         creds_json = os.getenv("GOOGLE_CREDS_JSON")
+        log.info("ENV CHECK: GOOGLE_CREDS_JSON present=%s length=%s", creds_json is not None, len(creds_json) if creds_json else 0)
+        log.info("ENV KEYS with GOOGLE: %s", [k for k in os.environ if "GOOGLE" in k])
         if creds_json:
             try:
                 creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
