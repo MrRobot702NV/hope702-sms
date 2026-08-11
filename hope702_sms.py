@@ -5,14 +5,17 @@ Twilio-powered SMS resource bot for Las Vegas homeless services.
 Runs on port 5702.
 """
 
-import csv
+import hashlib
+import hmac
 import json
 import re
 import logging
 import os
+import secrets
+import sqlite3
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -38,7 +41,13 @@ log = logging.getLogger(__name__)
 
 SHEET_NAME       = os.getenv("HOPE702_SHEET_NAME", "HOPE 702 Resource Database")
 CREDS_FILE       = os.getenv("HOPE702_CREDS_FILE", str(Path(__file__).parent / "creds.json"))
-ZIP_LOG_FILE     = Path(__file__).parent / "hope702_zip_log.csv"
+
+# Durable storage. On Railway this points at a mounted volume (set
+# HOPE702_DATA_DIR=/data), so the demand log survives redeploys — the container
+# filesystem does not. Falls back to the source directory for local runs.
+DATA_DIR         = Path(os.getenv("HOPE702_DATA_DIR", str(Path(__file__).parent)))
+DEMAND_DB_FILE   = DATA_DIR / "hope702_activity.db"
+ALLOWED_ORIGIN   = os.getenv("HOPE702_ALLOWED_ORIGIN", "https://hope702.org")
 SCOPES           = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive.readonly"]
 PAGE_SIZE        = 3
 SESSION_TIMEOUT  = 1800  # 30 minutes in seconds
@@ -172,11 +181,7 @@ CATEGORY_META: dict[str, dict] = {
     },
     "FOOD": {
         "emoji": "🍽️",
-        "label": "Food & Meals",
-    },
-    "WATER": {
-        "emoji": "💧",
-        "label": "Water & Hydration",
+        "label": "Food & Water",
     },
     "COOL": {
         "emoji": "❄️",
@@ -191,7 +196,7 @@ CATEGORY_META: dict[str, dict] = {
 KEYWORD_MAP: dict[str, str] = {
     "SHELTER": "SHELTER",
     "FOOD":    "FOOD",
-    "WATER":   "WATER",
+    "WATER":   "FOOD",
     "COOL":    "COOL",
     "COOLING": "COOL",
     "PET":     "PET",
@@ -217,11 +222,24 @@ SHELTER_TYPE_MAP: dict[str, str] = {
 
 def _get_pool(category: str, shelter_type: Optional[str] = None, zip_code: Optional[str] = None) -> list[Resource]:
     pool = [r for r in RESOURCES if r.category == category]
+    if category == "PET":
+        # No-ZIP PET rows are mobile outreach orgs — appended separately to
+        # every PET response by _mobile_pet_block(), so keep them out of the
+        # paged pool to avoid duplicates.
+        pool = [r for r in pool if r.zip_code]
     if category == "SHELTER" and shelter_type and shelter_type != "ALL":
         pool = [r for r in pool if shelter_type in r.shelter_type or r.shelter_type == ""]
     if zip_code:
         pool = [r for r in pool if not r.zip_code or r.zip_code == zip_code]
     return pool
+
+
+def _mobile_pet_block() -> str:
+    mobile = [r for r in RESOURCES if r.category == "PET" and not r.zip_code]
+    if not mobile:
+        return ""
+    body = "\n\n".join(_format_resource(r) for r in mobile)
+    return "\n\n" + "─" * 20 + "\n\n🚐 Mobile outreach, comes to you:\n\n" + body
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
@@ -263,17 +281,21 @@ def build_category_message(
     total = len(pool)
     page  = pool[offset:offset + PAGE_SIZE]
 
+    mobile_block = _mobile_pet_block() if category == "PET" else ""
+
     r_word = "resource" if total == 1 else "resources"
+    # "Pet-Friendly Resources" already ends in the noun — avoid "Resources resources"
+    label_noun = label if label.lower().endswith("resources") else f"{label} {r_word}"
 
     if not page:
         if offset == 0:
             if zip_code:
                 return (
-                    f"{emoji} No {label} {r_word} found near {zip_code}.\n\n"
+                    f"{emoji} No {label_noun} found near {zip_code}.\n\n"
                     f"Reply MORE for all results or try a different ZIP."
-                )
-            return f"{emoji} No {label} {r_word} found right now."
-        return f"That's all {total} {r_word}."
+                ) + mobile_block
+            return f"{emoji} No {label_noun} found right now." + mobile_block
+        return f"That's all {total} {r_word}." + mobile_block
 
     if offset > 0:
         range_end = min(offset + PAGE_SIZE, total)
@@ -293,16 +315,15 @@ def build_category_message(
     else:
         footer = f"\n\nThat's all {total} {r_word}."
 
-    return header + "\n\n" + body + footer
+    return header + "\n\n" + body + footer + mobile_block
 
 
 HOPE_MENU = (
     "HOPE 702 💛\n\n"
     "1 - Shelter\n"
     "2 - Cooling Center\n"
-    "3 - Food\n"
-    "4 - Water\n"
-    "5 - Pet Help\n\n"
+    "3 - Food & Water\n"
+    "4 - Pet Help\n\n"
     "Reply a number to get started.\n"
     "hope702.org"
 )
@@ -311,24 +332,101 @@ NUMBER_MAP: dict[str, str] = {
     "1": "SHELTER",
     "2": "COOL",
     "3": "FOOD",
-    "4": "WATER",
-    "5": "PET",
+    "4": "PET",
 }
 
 
-# ── ZIP logging ───────────────────────────────────────────────────────────────
+# ── Anonymous demand logging ──────────────────────────────────────────────────
+#
+# What is stored per text: ZIP, category, UTC timestamp. That is the whole row.
+# The phone number is NEVER written to disk in readable form — it is used only
+# to derive a keyed digest so repeat texters can be counted without knowing who
+# they are.
+#
+# Why HMAC with a secret key rather than a plain hash: there are only ~10^10
+# possible US phone numbers, so an unsalted SHA-256 of a number is reversible by
+# brute force in seconds and would not be anonymous at all. The secret is what
+# makes the digest non-invertible in practice, so it must stay secret and stay
+# stable (a rotating secret would silently break repeat-texter counting).
 
-def _log_zip(from_number: str, zip_code: str) -> None:
-    area_code = from_number.lstrip("+")[:1 + (1 if from_number.startswith("+1") else 0)]
-    area_code = from_number.lstrip("+")[1:4] if from_number.startswith("+1") else from_number[:3]
-    log.info("ZIP log → area_code=%r zip=%r", area_code, zip_code)
-    write_header = not ZIP_LOG_FILE.exists() or ZIP_LOG_FILE.stat().st_size == 0
-    with ZIP_LOG_FILE.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if write_header:
-            writer.writerow(["timestamp", "from_number", "area_code", "zip_code"])
-        timestamp = datetime.now(timezone.utc).isoformat()
-        writer.writerow([timestamp, from_number, area_code, zip_code])
+DEMAND_SCHEMA = """
+CREATE TABLE IF NOT EXISTS demand (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL,                 -- UTC ISO8601
+    day          TEXT NOT NULL,                 -- UTC date, for cheap grouping
+    zip_code     TEXT NOT NULL DEFAULT '',
+    category     TEXT NOT NULL DEFAULT '',
+    contact_hash TEXT NOT NULL                  -- HMAC-SHA256(secret, phone)
+);
+CREATE INDEX IF NOT EXISTS idx_demand_day ON demand(day);
+CREATE INDEX IF NOT EXISTS idx_demand_zip ON demand(zip_code);
+CREATE INDEX IF NOT EXISTS idx_demand_cat ON demand(category);
+"""
+
+
+def _load_contact_secret() -> bytes:
+    """Key for the contact digest. Prefers HOPE702_HASH_SALT; otherwise keeps a
+    generated key beside the database so dedup survives restarts."""
+    env = os.getenv("HOPE702_HASH_SALT", "").strip()
+    if env:
+        return env.encode("utf-8")
+    key_file = DATA_DIR / ".contact_secret"
+    try:
+        if key_file.exists():
+            return key_file.read_bytes()
+        key = secrets.token_bytes(32)
+        key_file.write_bytes(key)
+        try:
+            os.chmod(key_file, 0o600)
+        except OSError:
+            pass
+        log.warning("HOPE702_HASH_SALT not set — generated a keyfile at %s", key_file)
+        return key
+    except OSError as exc:
+        # Read-only disk: fall back to a per-process key. Privacy is preserved;
+        # only cross-restart dedup is lost, so say so rather than failing quietly.
+        log.warning("could not persist contact secret (%s) — using a "
+                    "per-process key; repeat-texter counts reset on restart", exc)
+        return secrets.token_bytes(32)
+
+
+_CONTACT_SECRET: Optional[bytes] = None
+
+
+def _contact_digest(from_number: str) -> str:
+    global _CONTACT_SECRET
+    if _CONTACT_SECRET is None:
+        _CONTACT_SECRET = _load_contact_secret()
+    return hmac.new(_CONTACT_SECRET, (from_number or "").encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:16]
+
+
+def _demand_db() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DEMAND_DB_FILE, timeout=5)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.executescript(DEMAND_SCHEMA)
+    return con
+
+
+def log_demand(from_number: str, zip_code: str, category: str) -> None:
+    """Record one anonymous demand row. No-op when nothing was resolved."""
+    zip_code = (zip_code or "").strip()
+    category = (category or "").strip().upper()
+    if not zip_code and not category:
+        return                       # nothing resolved — nothing worth storing
+    now = datetime.now(timezone.utc)
+    try:
+        with _demand_db() as con:
+            con.execute(
+                "INSERT INTO demand(ts, day, zip_code, category, contact_hash)"
+                " VALUES(?,?,?,?,?)",
+                (now.isoformat(), now.strftime("%Y-%m-%d"), zip_code, category,
+                 _contact_digest(from_number)))
+    except sqlite3.Error as exc:
+        # Logging demand must never cost a texter their reply.
+        log.warning("demand log write failed: %s", exc)
+    log.info("demand → zip=%s category=%s", zip_code or "-", category or "-")
 
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
@@ -349,7 +447,9 @@ def sms():
     raw_body    = request.form.get("Body", "")
     body        = raw_body.strip().upper()
 
-    log.info("SMS from %s: %r", from_number, raw_body)
+    # The number is masked here too: this log file is durable storage, so
+    # "never store the phone number in plain text" has to cover it as well.
+    log.info("SMS from %s: %r", _contact_digest(from_number), raw_body)
 
     resp = MessagingResponse()
 
@@ -358,11 +458,18 @@ def sms():
     if body.isdigit() and len(body) == 5:
         zip_code = body
 
-    _log_zip(from_number, zip_code)
+    # Demand attributes for this text, filled in as the branches below resolve
+    # them. _reply() writes the row; log_demand skips it when neither resolved.
+    demand_zip, demand_cat = zip_code, ""
+
+    def _reply() -> Response:
+        log_demand(from_number, demand_zip, demand_cat)
+        return Response(str(resp), mimetype="text/xml")
 
     if zip_code:
         session = _get_session(from_number)
         if session:
+            demand_cat = session.category
             log.info("→ ZIP %s refining session category=%s", zip_code, session.category)
             pool_check = _get_pool(session.category, session.shelter_type, zip_code)
             if pool_check:
@@ -373,7 +480,7 @@ def sms():
                 session.offset = PAGE_SIZE
             session.timestamp = time.time()
             resp.message(build_category_message(session.category, offset=0, shelter_type=session.shelter_type, zip_code=zip_code))
-            return Response(str(resp), mimetype="text/xml")
+            return _reply()
 
     if len(user_sessions) > 100:
         _cleanup_sessions()
@@ -381,6 +488,10 @@ def sms():
     if body == "MORE":
         session = _get_session(from_number)
         if session:
+            # A MORE is continued interest in the same category, so it counts as
+            # demand for it. It inherits the session's ZIP when one was given.
+            demand_cat = session.category
+            demand_zip = session.zip_code or demand_zip
             log.info("→ MORE  category=%s offset=%d shelter_type=%s zip=%s", session.category, session.offset, session.shelter_type, session.zip_code)
             resp.message(build_category_message(session.category, session.offset, session.shelter_type, session.zip_code))
             _advance_session(session)
@@ -390,10 +501,11 @@ def sms():
                 "Text HOPE for Las Vegas resources.\n"
                 "Keywords: COOL · SHELTER · FOOD · WATER · PET"
             )
-        return Response(str(resp), mimetype="text/xml")
+        return _reply()
 
     if body in NUMBER_MAP:
         cat = NUMBER_MAP[body]
+        demand_cat = cat
         log.info("→ number shortcut %s → %s", body, cat)
         if cat == "SHELTER":
             resp.message(
@@ -416,12 +528,14 @@ def sms():
 
     elif body in SHELTER_TYPE_MAP:
         shelter_type = SHELTER_TYPE_MAP[body]
+        demand_cat = "SHELTER"
         log.info("→ shelter type %s", shelter_type)
         resp.message(build_category_message("SHELTER", shelter_type=shelter_type))
         _set_session(from_number, "SHELTER", shelter_type=shelter_type)
 
     elif body in KEYWORD_MAP:
         cat = KEYWORD_MAP[body]
+        demand_cat = cat
         if cat == "SHELTER":
             resp.message(
                 "What type of shelter do you need?\n\n"
@@ -446,7 +560,69 @@ def sms():
             "hope702.org"
         )
 
-    return Response(str(resp), mimetype="text/xml")
+    return _reply()
+
+
+@app.route("/api/activity", methods=["GET"])
+def api_activity():
+    """Anonymous aggregates only: counts by ZIP, by category, by day.
+
+    Deliberately has no way to return a row. Every query below is a GROUP BY
+    with a COUNT, and contact_hash is never selected or exposed — the endpoint
+    cannot leak an individual text even if something upstream asked it to.
+    """
+    try:
+        con = _demand_db()
+    except sqlite3.Error as exc:
+        log.warning("activity read failed: %s", exc)
+        return {"error": "activity store unavailable"}, 503
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        week_start = (datetime.now(timezone.utc) - timedelta(days=6)).strftime("%Y-%m-%d")
+
+        by_zip = [{"zip": z, "texts": n} for z, n in con.execute(
+            "SELECT zip_code, COUNT(*) FROM demand WHERE zip_code <> ''"
+            " GROUP BY zip_code ORDER BY 2 DESC")]
+        by_category = [{"category": c, "texts": n} for c, n in con.execute(
+            "SELECT category, COUNT(*) FROM demand WHERE category <> ''"
+            " GROUP BY category ORDER BY 2 DESC")]
+        by_day = [{"day": d, "texts": n} for d, n in con.execute(
+            "SELECT day, COUNT(*) FROM demand GROUP BY day ORDER BY day DESC"
+            " LIMIT 60")]
+        # ZIP x category, so the dashboard's category filter still means
+        # something in demand mode ("which ZIP needs what"). Still a pure
+        # count — the cross-tab carries no more identity than its margins.
+        by_zip_category = [{"zip": z, "category": c, "texts": n}
+                           for z, c, n in con.execute(
+            "SELECT zip_code, category, COUNT(*) FROM demand"
+            " WHERE zip_code <> '' AND category <> ''"
+            " GROUP BY zip_code, category ORDER BY 3 DESC")]
+        total = con.execute("SELECT COUNT(*) FROM demand").fetchone()[0]
+        this_week = con.execute(
+            "SELECT COUNT(*) FROM demand WHERE day >= ?", (week_start,)).fetchone()[0]
+        today_n = con.execute(
+            "SELECT COUNT(*) FROM demand WHERE day = ?", (today,)).fetchone()[0]
+        # Distinct texters, from the keyed digest — a count, never the digests.
+        people_week = con.execute(
+            "SELECT COUNT(DISTINCT contact_hash) FROM demand WHERE day >= ?",
+            (week_start,)).fetchone()[0]
+    finally:
+        con.close()
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "week_start": week_start,
+        "totals": {"all_time": total, "this_week": this_week,
+                   "today": today_n, "people_this_week": people_week},
+        "by_zip": by_zip,
+        "by_category": by_category,
+        "by_zip_category": by_zip_category,
+        "by_day": by_day,
+    }
+    resp = app.response_class(json.dumps(payload), mimetype="application/json")
+    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/health", methods=["GET"])

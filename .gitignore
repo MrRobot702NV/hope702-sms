@@ -16,3 +16,10 @@ venv/
 # Output data
 output/
 *.csv
+
+# Anonymous demand store and its HMAC key. The key MUST never be committed —
+# with it, the contact digests become reversible against the ~10^10 US phone
+# number space, which is the whole thing the digest exists to prevent.
+hope702_activity.db
+hope702_activity.db-*
+.contact_secret
