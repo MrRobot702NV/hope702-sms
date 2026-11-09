@@ -218,17 +218,48 @@ SHELTER_TYPE_MAP: dict[str, str] = {
     "ALL":    "ALL",
 }
 
+# What each shelter choice matches in the sheet's "Shelter/Station Type"
+# column. The sheet uses descriptive labels ("Adults without Children",
+# "Families with Children", "Fleeing Domestic Violence", "Young Adults"), so a
+# plain substring test on the reply keyword ("MEN" in "ADULTS WITHOUT
+# CHILDREN") finds nothing. Whole-word patterns also keep MEN from matching
+# WOMEN.
+SHELTER_TYPE_PATTERNS: dict[str, re.Pattern] = {
+    "MEN":    re.compile(r"\bADULTS? WITHOUT CHILDREN\b|\bSINGLE ADULTS?\b|\bALL ADULTS\b|\bMEN\b"),
+    "WOMEN":  re.compile(r"\bWOMEN\b|DOMESTIC VIOLENCE|\bDV\b"),
+    "FAMILY": re.compile(r"\bFAMILY\b|\bFAMILIES\b|\bWITH CHILDREN\b"),
+    "YOUTH":  re.compile(r"\bYOUTH\b|\bYOUNG ADULTS?\b|\bTEENS?\b"),
+    "VET":    re.compile(r"\bVETERANS?\b|\bVETS?\b"),
+}
+
+
+def _shelter_type_matches(row_type: str, wanted: str) -> bool:
+    if not row_type:
+        return True                  # untyped shelters serve everyone
+    pattern = SHELTER_TYPE_PATTERNS.get(wanted)
+    return bool(pattern.search(row_type)) if pattern else wanted in row_type
+
+
+def _in_category(r: Resource, category: str) -> bool:
+    """A row belongs to a category through its Category column or through its
+    Categories column (comma-separated). The libraries are Category "Library"
+    with Categories "COOL", so checking Category alone hid all 29 of them."""
+    if r.category == category:
+        return True
+    tags = {t.strip().upper() for t in re.split(r"[,;/]", r.categories) if t.strip()}
+    return category in tags
+
 # ── Pool builder ──────────────────────────────────────────────────────────────
 
 def _get_pool(category: str, shelter_type: Optional[str] = None, zip_code: Optional[str] = None) -> list[Resource]:
-    pool = [r for r in RESOURCES if r.category == category]
+    pool = [r for r in RESOURCES if _in_category(r, category)]
     if category == "PET":
         # No-ZIP PET rows are mobile outreach orgs — appended separately to
         # every PET response by _mobile_pet_block(), so keep them out of the
         # paged pool to avoid duplicates.
         pool = [r for r in pool if r.zip_code]
     if category == "SHELTER" and shelter_type and shelter_type != "ALL":
-        pool = [r for r in pool if shelter_type in r.shelter_type or r.shelter_type == ""]
+        pool = [r for r in pool if _shelter_type_matches(r.shelter_type, shelter_type)]
     if zip_code:
         pool = [r for r in pool if not r.zip_code or r.zip_code == zip_code]
     return pool
