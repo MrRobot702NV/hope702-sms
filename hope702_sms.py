@@ -224,18 +224,40 @@ SHELTER_TYPE_MAP: dict[str, str] = {
 # plain substring test on the reply keyword ("MEN" in "ADULTS WITHOUT
 # CHILDREN") finds nothing. Whole-word patterns also keep MEN from matching
 # WOMEN.
+# "Adults without Children" shelters take single women too, so they answer
+# both MEN and WOMEN. A row marks itself "Men only" / "Women only" in that
+# column to drop out of the other list.
+_ADULTS = r"\bADULTS? WITHOUT CHILDREN\b|\bSINGLE ADULTS?\b|\bALL ADULTS\b"
 SHELTER_TYPE_PATTERNS: dict[str, re.Pattern] = {
-    "MEN":    re.compile(r"\bADULTS? WITHOUT CHILDREN\b|\bSINGLE ADULTS?\b|\bALL ADULTS\b|\bMEN\b"),
-    "WOMEN":  re.compile(r"\bWOMEN\b|DOMESTIC VIOLENCE|\bDV\b"),
+    "MEN":    re.compile(_ADULTS + r"|\bMEN\b"),
+    "WOMEN":  re.compile(_ADULTS + r"|\bWOMEN\b|DOMESTIC VIOLENCE|\bDV\b"),
     "FAMILY": re.compile(r"\bFAMILY\b|\bFAMILIES\b|\bWITH CHILDREN\b"),
     "YOUTH":  re.compile(r"\bYOUTH\b|\bYOUNG ADULTS?\b|\bTEENS?\b"),
     "VET":    re.compile(r"\bVETERANS?\b|\bVETS?\b"),
 }
+SHELTER_TYPE_EXCLUDE: dict[str, re.Pattern] = {
+    "MEN":   re.compile(r"\bWOMEN ONLY\b"),
+    "WOMEN": re.compile(r"\bMEN ONLY\b"),
+}
+
+SHELTER_TYPE_PROMPT = (
+    "What type of shelter do you need?\n\n"
+    "Reply:\n"
+    "MEN - Single men\n"
+    "WOMEN - Single women or fleeing abuse\n"
+    "FAMILY - Families with children\n"
+    "YOUTH - Youth and young adults\n"
+    "VET - Veterans\n"
+    "ALL - Show all shelters"
+)
 
 
 def _shelter_type_matches(row_type: str, wanted: str) -> bool:
     if not row_type:
         return True                  # untyped shelters serve everyone
+    exclude = SHELTER_TYPE_EXCLUDE.get(wanted)
+    if exclude and exclude.search(row_type):
+        return False
     pattern = SHELTER_TYPE_PATTERNS.get(wanted)
     return bool(pattern.search(row_type)) if pattern else wanted in row_type
 
@@ -284,6 +306,10 @@ def _format_resource(r: Resource) -> str:
     if r.hours:
         hours = r.hours.strip()
         parts.append(hours[:60] + "…" if len(hours) > 60 else hours)
+    # The Pets column was never texted, so "this place takes pets" (the whole
+    # point for someone who won't leave their dog) didn't reach anyone.
+    if r.pets.strip().lower() in ("yes", "y"):
+        parts.append("Pets OK 🐾")
     if r.eligibility:
         elig = r.eligibility.strip()
         elig_low = elig.lower()
@@ -539,16 +565,7 @@ def sms():
         demand_cat = cat
         log.info("→ number shortcut %s → %s", body, cat)
         if cat == "SHELTER":
-            resp.message(
-                "What type of shelter do you need?\n\n"
-                "Reply:\n"
-                "MEN - Adults without children\n"
-                "FAMILY - Families with children\n"
-                "WOMEN - Fleeing domestic violence\n"
-                "YOUTH - Youth under 18\n"
-                "VET - Veterans\n"
-                "ALL - Show all shelters"
-            )
+            resp.message(SHELTER_TYPE_PROMPT)
         else:
             resp.message(build_category_message(cat))
             _set_session(from_number, cat)
@@ -568,16 +585,7 @@ def sms():
         cat = KEYWORD_MAP[body]
         demand_cat = cat
         if cat == "SHELTER":
-            resp.message(
-                "What type of shelter do you need?\n\n"
-                "Reply:\n"
-                "MEN - Adults without children\n"
-                "FAMILY - Families with children\n"
-                "WOMEN - Fleeing domestic violence\n"
-                "YOUTH - Youth under 18\n"
-                "VET - Veterans\n"
-                "ALL - Show all shelters"
-            )
+            resp.message(SHELTER_TYPE_PROMPT)
         else:
             resp.message(build_category_message(cat))
             _set_session(from_number, cat)
