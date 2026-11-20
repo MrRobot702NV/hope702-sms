@@ -22,6 +22,7 @@ from typing import Optional
 import gspread
 from flask import Flask, Response, request
 from google.oauth2.service_account import Credentials
+from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -47,10 +48,20 @@ CREDS_FILE       = os.getenv("HOPE702_CREDS_FILE", str(Path(__file__).parent / "
 # filesystem does not. Falls back to the source directory for local runs.
 DATA_DIR         = Path(os.getenv("HOPE702_DATA_DIR", str(Path(__file__).parent)))
 DEMAND_DB_FILE   = DATA_DIR / "hope702_activity.db"
-ALLOWED_ORIGIN   = os.getenv("HOPE702_ALLOWED_ORIGIN", "https://hope702.org")
-SCOPES           = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive.readonly"]
+SCOPES          = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive.readonly"]
 PAGE_SIZE        = 3
 SESSION_TIMEOUT  = 1800  # 30 minutes in seconds
+
+# Shared secret for the private endpoints (/api/activity and /reload). Only the
+# website's server (its Netlify functions) holds it, in the same variable name.
+# When it is unset those endpoints stay closed, never open.
+API_KEY          = os.getenv("HOPE702_API_KEY", "").strip()
+
+# Optional. With the account's Auth Token, /sms can tell a real Twilio webhook
+# from a forged POST. Forged texts still get a reply (it's public information
+# and a misconfiguration must never cost a real texter theirs), but they are
+# not counted on the demand map.
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 
 # ── Resource dataclass ────────────────────────────────────────────────────────
 
@@ -491,6 +502,37 @@ def log_demand(from_number: str, zip_code: str, category: str) -> None:
 app = Flask(__name__)
 
 
+def _key_refusal():
+    """None when the request carries the shared key; otherwise the response to
+    send instead. Compared in constant time so the key can't be guessed by
+    timing."""
+    if not API_KEY:
+        log.warning("%s refused: HOPE702_API_KEY is not set", request.path)
+        return {"error": "not configured"}, 503
+    sent = request.headers.get("X-HOPE702-Key", "")
+    if not hmac.compare_digest(sent.encode("utf-8"), API_KEY.encode("utf-8")):
+        log.warning("%s refused: missing or wrong key", request.path)
+        return {"error": "unauthorized"}, 401
+    return None
+
+
+_TWILIO_VALIDATOR = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+
+
+def _from_twilio() -> bool:
+    """True when /sms carries a valid Twilio signature, or when there is no
+    TWILIO_AUTH_TOKEN to check it against."""
+    if _TWILIO_VALIDATOR is None:
+        return True
+    # Twilio signs the public https URL it called. Railway's proxy hands Flask
+    # plain http, so put the original scheme back before checking.
+    url = request.url
+    if request.headers.get("X-Forwarded-Proto", "") == "https" and url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return _TWILIO_VALIDATOR.validate(
+        url, request.form.to_dict(), request.headers.get("X-Twilio-Signature", ""))
+
+
 @app.before_request
 def _ensure_resources():
     global RESOURCES
@@ -518,9 +560,13 @@ def sms():
     # Demand attributes for this text, filled in as the branches below resolve
     # them. _reply() writes the row; log_demand skips it when neither resolved.
     demand_zip, demand_cat = zip_code, ""
+    genuine = _from_twilio()
 
     def _reply() -> Response:
-        log_demand(from_number, demand_zip, demand_cat)
+        if genuine:
+            log_demand(from_number, demand_zip, demand_cat)
+        else:
+            log.warning("unsigned /sms request: replied, not counted as demand")
         return Response(str(resp), mimetype="text/xml")
 
     if zip_code:
@@ -609,7 +655,12 @@ def api_activity():
     Deliberately has no way to return a row. Every query below is a GROUP BY
     with a COUNT, and contact_hash is never selected or exposed — the endpoint
     cannot leak an individual text even if something upstream asked it to.
+    Only the website's server can call it (shared key); the dashboard reads it
+    through that proxy after its own login.
     """
+    refusal = _key_refusal()
+    if refusal:
+        return refusal
     try:
         con = _demand_db()
     except sqlite3.Error as exc:
@@ -658,21 +709,36 @@ def api_activity():
         "by_zip_category": by_zip_category,
         "by_day": by_day,
     }
+    # Server-to-server only now, so no CORS header: a browser has no business
+    # reading this directly.
     resp = app.response_class(json.dumps(payload), mimetype="application/json")
-    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok", "resources": len(RESOURCES), "active_sessions": len(user_sessions)}, 200
+    # Public uptime check. Live session counts are left out: how many people
+    # are mid-conversation right now isn't anyone else's business.
+    return {"status": "ok", "resources": len(RESOURCES)}, 200
 
 
 @app.route("/reload", methods=["POST"])
 def reload_resources():
+    """Re-read the Google Sheet. Shared key required, so only the website's
+    server (the dashboard's Reload button) can trigger it."""
     global RESOURCES
-    RESOURCES = load_resources_from_sheet()
+    refusal = _key_refusal()
+    if refusal:
+        return refusal
+    fresh = load_resources_from_sheet()
+    if not fresh:
+        # A failed read returns []. Keep serving the list we have rather than
+        # leaving the line with nothing to send.
+        log.warning("reload read 0 resources; keeping the %d already loaded", len(RESOURCES))
+        return {"status": "error", "error": "sheet read returned nothing",
+                "resources": len(RESOURCES)}, 502
+    RESOURCES = fresh
     return {"status": "ok", "resources": len(RESOURCES)}, 200
 
 
